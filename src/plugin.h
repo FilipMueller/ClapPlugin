@@ -1,8 +1,11 @@
 #pragma once
 
+#include "delay_parameters.h"
+#include "delay_processor.h"
+#include "metrics_csv_logger.h"
+#include "realtime_metrics.h"
+
 #include <atomic>
-#include <cstdint>
-#include <vector>
 
 #include <clap/clap.h>
 
@@ -45,6 +48,7 @@ public:
         ParamFeedback = 2,
         ParamMix = 3,
         ParamOutputDb = 4,
+        ParamDspComplexity = 5,
     };
 
     struct ParameterDefinition {
@@ -60,13 +64,11 @@ public:
     static const clap_plugin_descriptor_t* descriptor() noexcept;
     static const ParameterDefinition* findParameter(clap_id id) noexcept;
     static double clampToParameterRange(clap_id id, double value) noexcept;
-    static float dbToGain(double db) noexcept;
 
     void handleEvent(const clap_event_header_t* event) noexcept;
     void setParameter(clap_id id, double value) noexcept;
     double getParameter(clap_id id) const noexcept;
-    void clearDelayBuffer() noexcept;
-    void processSample(float inL, float inR, float& outL, float& outR) noexcept;
+    DelayParameters currentDelayParameters() const noexcept;
 
     static DelayPlugin& from(const clap_plugin_t* plugin) noexcept;
 
@@ -126,11 +128,9 @@ private:
     uint32_t maxFrameCount_ = 0;
     bool active_ = false;
 
-    static constexpr double maxDelaySeconds_ = 5.0;
-    std::vector<float> delayBufferL_;
-    std::vector<float> delayBufferR_;
-    uint32_t delayBufferSize_ = 0;
-    uint32_t writePosition_ = 0;
+    DelayProcessor delayProcessor_;
+    RealtimeMetrics metrics_;
+    MetricsCsvLogger metricsLogger_;
 
     std::atomic<double> bypass_ {0.0};
     std::atomic<double> delayMs_ {350.0};

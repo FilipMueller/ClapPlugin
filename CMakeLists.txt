@@ -13,6 +13,13 @@ add_library(FilipDelay MODULE
         src/entry.cpp
         src/plugin.cpp
         src/plugin.h
+        src/delay_parameters.h
+        src/delay_processor.cpp
+        src/delay_processor.h
+        src/realtime_metrics.h
+        src/scoped_process_timer.h
+        src/metrics_csv_logger.h
+        src/metrics_csv_logger.cpp
 )
 
 target_link_libraries(FilipDelay PRIVATE clap clap-helpers)

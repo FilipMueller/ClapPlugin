@@ -1,9 +1,10 @@
 #include "plugin.h"
 
+#include "scoped_process_timer.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <new>
@@ -117,6 +118,61 @@ bool readBytes(const clap_istream_t* stream, void* data, uint64_t size) noexcept
 
     return true;
 }
+
+template <typename HandleEvent, typename ProcessFrame>
+void processByEventSegments(const clap_process_t* process,
+                            HandleEvent&& handleEvent,
+                            ProcessFrame&& processFrame) noexcept {
+    const uint32_t frames = process->frames_count;
+    const uint32_t eventCount = process->in_events ? process->in_events->size(process->in_events) : 0;
+    uint32_t eventIndex = 0;
+    uint32_t nextEventFrame = 0;
+
+    while (eventIndex < eventCount) {
+        const clap_event_header_t* event = process->in_events->get(process->in_events, eventIndex);
+        if (event && event->time == 0) {
+            handleEvent(event);
+            ++eventIndex;
+        } else {
+            nextEventFrame = event ? std::min<uint32_t>(event->time, frames) : frames;
+            break;
+        }
+    }
+
+    if (eventIndex >= eventCount) {
+        nextEventFrame = frames;
+    }
+
+    for (uint32_t frame = 0; frame < frames;) {
+        while (eventIndex < eventCount && nextEventFrame == frame) {
+            const clap_event_header_t* event = process->in_events->get(process->in_events, eventIndex);
+            if (!event) {
+                ++eventIndex;
+                continue;
+            }
+
+            if (event->time != frame) {
+                nextEventFrame = std::min<uint32_t>(event->time, frames);
+                break;
+            }
+
+            handleEvent(event);
+            ++eventIndex;
+
+            if (eventIndex < eventCount) {
+                const clap_event_header_t* nextEvent = process->in_events->get(process->in_events, eventIndex);
+                nextEventFrame = nextEvent ? std::min<uint32_t>(nextEvent->time, frames) : frames;
+            } else {
+                nextEventFrame = frames;
+            }
+        }
+
+        const uint32_t endFrame = std::max(frame + 1, nextEventFrame);
+        for (; frame < endFrame && frame < frames; ++frame) {
+            processFrame(frame);
+        }
+    }
+}
 } // namespace
 
 DelayPlugin::DelayPlugin(const clap_host_t* host) noexcept : host_(host) {
@@ -179,10 +235,6 @@ double DelayPlugin::clampToParameterRange(clap_id id, double value) noexcept {
     return std::clamp(value, param->minValue, param->maxValue);
 }
 
-float DelayPlugin::dbToGain(double db) noexcept {
-    return static_cast<float>(std::pow(10.0, db / 20.0));
-}
-
 DelayPlugin& DelayPlugin::from(const clap_plugin_t* plugin) noexcept {
     return *static_cast<DelayPlugin*>(plugin->plugin_data);
 }
@@ -199,29 +251,33 @@ bool DelayPlugin::activate(double sampleRate, uint32_t, uint32_t maxFrameCount) 
     sampleRate_ = sampleRate;
     maxFrameCount_ = maxFrameCount;
 
-    const auto requestedSize = static_cast<uint32_t>(std::ceil(sampleRate_ * maxDelaySeconds_)) +
-                               maxFrameCount_ + 1;
-    delayBufferSize_ = std::max<uint32_t>(requestedSize, 2);
-
-    try {
-        delayBufferL_.assign(delayBufferSize_, 0.0f);
-        delayBufferR_.assign(delayBufferSize_, 0.0f);
-    } catch (...) {
-        delayBufferSize_ = 0;
+    if (!delayProcessor_.prepare(sampleRate_, maxFrameCount_)) {
+        active_ = false;
         return false;
     }
 
-    writePosition_ = 0;
+    metrics_.reset();
+    metrics_.configure(sampleRate_, maxFrameCount_, 2);
+
+    const DelayParameters params = currentDelayParameters();
+    metrics_.updateDelayParameters(
+        params.delayMs,
+        delayProcessor_.computeDelaySamples(params.delayMs),
+        params.feedback,
+        params.mix
+    );
+
+    metricsLogger_.start(metrics_);
+
     active_ = true;
     return true;
 }
 
 void DelayPlugin::deactivate() noexcept {
     active_ = false;
-    delayBufferL_.clear();
-    delayBufferR_.clear();
-    delayBufferSize_ = 0;
-    writePosition_ = 0;
+    metricsLogger_.stop();
+    delayProcessor_.release();
+    metrics_.reset();
 }
 
 bool DelayPlugin::startProcessing() noexcept {
@@ -231,176 +287,106 @@ bool DelayPlugin::startProcessing() noexcept {
 void DelayPlugin::stopProcessing() noexcept {}
 
 void DelayPlugin::reset() noexcept {
-    clearDelayBuffer();
-}
-
-void DelayPlugin::clearDelayBuffer() noexcept {
-    std::fill(delayBufferL_.begin(), delayBufferL_.end(), 0.0f);
-    std::fill(delayBufferR_.begin(), delayBufferR_.end(), 0.0f);
-    writePosition_ = 0;
-}
-
-void DelayPlugin::handleEvent(const clap_event_header_t* event) noexcept {
-    if (!event || event->space_id != CLAP_CORE_EVENT_SPACE_ID) {
-        return;
-    }
-
-    if (event->type == CLAP_EVENT_PARAM_VALUE) {
-        const auto* paramEvent = reinterpret_cast<const clap_event_param_value_t*>(event);
-        setParameter(paramEvent->param_id, paramEvent->value);
-    }
-}
-
-void DelayPlugin::setParameter(clap_id id, double value) noexcept {
-    const double clampedValue = clampToParameterRange(id, value);
-
-    switch (id) {
-        case ParamBypass:
-            bypass_.store(clampedValue >= 0.5 ? 1.0 : 0.0, std::memory_order_relaxed);
-            break;
-        case ParamDelayMs:
-            delayMs_.store(clampedValue, std::memory_order_relaxed);
-            break;
-        case ParamFeedback:
-            feedback_.store(clampedValue, std::memory_order_relaxed);
-            break;
-        case ParamMix:
-            mix_.store(clampedValue, std::memory_order_relaxed);
-            break;
-        case ParamOutputDb:
-            outputDb_.store(clampedValue, std::memory_order_relaxed);
-            break;
-        default:
-            break;
-    }
-}
-
-double DelayPlugin::getParameter(clap_id id) const noexcept {
-    switch (id) {
-        case ParamBypass:
-            return bypass_.load(std::memory_order_relaxed);
-        case ParamDelayMs:
-            return delayMs_.load(std::memory_order_relaxed);
-        case ParamFeedback:
-            return feedback_.load(std::memory_order_relaxed);
-        case ParamMix:
-            return mix_.load(std::memory_order_relaxed);
-        case ParamOutputDb:
-            return outputDb_.load(std::memory_order_relaxed);
-        default:
-            return 0.0;
-    }
-}
-
-void DelayPlugin::processSample(float inL, float inR, float& outL, float& outR) noexcept {
-    if (delayBufferSize_ == 0) {
-        outL = inL;
-        outR = inR;
-        return;
-    }
-
-    const bool bypassed = bypass_.load(std::memory_order_relaxed) >= 0.5;
-    const double delayMs = delayMs_.load(std::memory_order_relaxed);
-    const float feedback = static_cast<float>(feedback_.load(std::memory_order_relaxed));
-    const float mix = static_cast<float>(mix_.load(std::memory_order_relaxed));
-    const float gain = dbToGain(outputDb_.load(std::memory_order_relaxed));
-
-    const auto delaySamples = static_cast<uint32_t>(std::clamp(
-        std::llround((delayMs / 1000.0) * sampleRate_),
-        1LL,
-        static_cast<long long>(delayBufferSize_ - 1)));
-
-    const uint32_t readPosition = (writePosition_ + delayBufferSize_ - delaySamples) % delayBufferSize_;
-
-    const float delayedL = delayBufferL_[readPosition];
-    const float delayedR = delayBufferR_[readPosition];
-
-    if (bypassed) {
-        outL = inL;
-        outR = inR;
-        delayBufferL_[writePosition_] = inL;
-        delayBufferR_[writePosition_] = inR;
-    } else {
-        delayBufferL_[writePosition_] = inL + delayedL * feedback;
-        delayBufferR_[writePosition_] = inR + delayedR * feedback;
-
-        outL = ((1.0f - mix) * inL + mix * delayedL) * gain;
-        outR = ((1.0f - mix) * inR + mix * delayedR) * gain;
-    }
-
-    ++writePosition_;
-    if (writePosition_ >= delayBufferSize_) {
-        writePosition_ = 0;
-    }
+    delayProcessor_.reset();
 }
 
 clap_process_status DelayPlugin::process(const clap_process_t* process) noexcept {
-    if (!process || process->audio_inputs_count < 1 || process->audio_outputs_count < 1 ||
-        !process->audio_inputs || !process->audio_outputs || delayBufferSize_ == 0) {
+    if (!process ||
+        process->audio_inputs_count < 1 ||
+        process->audio_outputs_count < 1 ||
+        !process->audio_inputs ||
+        !process->audio_outputs ||
+        !delayProcessor_.isPrepared()) {
         return CLAP_PROCESS_CONTINUE;
     }
 
     const auto& input = process->audio_inputs[0];
     auto& output = process->audio_outputs[0];
 
-    if (input.channel_count < 1 || output.channel_count < 1 || !input.data32 || !output.data32) {
+    if (input.channel_count < 1 || output.channel_count < 1) {
         return CLAP_PROCESS_CONTINUE;
     }
 
     const uint32_t frames = process->frames_count;
-    const uint32_t eventCount = process->in_events ? process->in_events->size(process->in_events) : 0;
-    uint32_t eventIndex = 0;
-    uint32_t nextEventFrame = 0;
+    const uint32_t channelCount = std::min<uint32_t>(input.channel_count, output.channel_count);
+    metrics_.configure(sampleRate_, maxFrameCount_, channelCount);
 
-    while (eventIndex < eventCount) {
-        const clap_event_header_t* event = process->in_events->get(process->in_events, eventIndex);
-        if (event && event->time == 0) {
-            handleEvent(event);
-            ++eventIndex;
-        } else {
-            nextEventFrame = event ? std::min<uint32_t>(event->time, frames) : frames;
-            break;
-        }
+    const DelayParameters paramsForMetrics = currentDelayParameters();
+    metrics_.updateDelayParameters(
+        paramsForMetrics.delayMs,
+        delayProcessor_.computeDelaySamples(paramsForMetrics.delayMs),
+        paramsForMetrics.feedback,
+        paramsForMetrics.mix
+    );
+
+    if (input.data32 && output.data32) {
+        metrics_.updateBlock(frames, 32);
+        ScopedProcessTimer timer(metrics_);
+
+        processByEventSegments(
+            process,
+            [this](const clap_event_header_t* event) noexcept {
+                handleEvent(event);
+            },
+            [this, &input, &output](uint32_t frame) noexcept {
+                const float inL = input.data32[0][frame];
+                const float inR = input.channel_count > 1 ? input.data32[1][frame] : inL;
+
+                float outL = 0.0f;
+                float outR = 0.0f;
+
+                delayProcessor_.processSample(
+                    inL,
+                    inR,
+                    outL,
+                    outR,
+                    currentDelayParameters()
+                );
+
+                output.data32[0][frame] = outL;
+
+                if (output.channel_count > 1) {
+                    output.data32[1][frame] = outR;
+                }
+            }
+        );
+
+        return CLAP_PROCESS_CONTINUE;
     }
-    if (eventIndex >= eventCount) {
-        nextEventFrame = frames;
-    }
 
-    for (uint32_t frame = 0; frame < frames;) {
-        while (eventIndex < eventCount && nextEventFrame == frame) {
-            const clap_event_header_t* event = process->in_events->get(process->in_events, eventIndex);
-            if (!event) {
-                ++eventIndex;
-                continue;
-            }
-            if (event->time != frame) {
-                nextEventFrame = std::min<uint32_t>(event->time, frames);
-                break;
-            }
-            handleEvent(event);
-            ++eventIndex;
-            if (eventIndex < eventCount) {
-                const clap_event_header_t* nextEvent = process->in_events->get(process->in_events, eventIndex);
-                nextEventFrame = nextEvent ? std::min<uint32_t>(nextEvent->time, frames) : frames;
-            } else {
-                nextEventFrame = frames;
-            }
-        }
+    if (input.data64 && output.data64) {
+        metrics_.updateBlock(frames, 64);
+        ScopedProcessTimer timer(metrics_);
 
-        const uint32_t endFrame = std::max(frame + 1, nextEventFrame);
-        for (; frame < endFrame && frame < frames; ++frame) {
-            const float inL = input.data32[0][frame];
-            const float inR = input.channel_count > 1 ? input.data32[1][frame] : inL;
+        processByEventSegments(
+            process,
+            [this](const clap_event_header_t* event) noexcept {
+                handleEvent(event);
+            },
+            [this, &input, &output](uint32_t frame) noexcept {
+                const double inL = input.data64[0][frame];
+                const double inR = input.channel_count > 1 ? input.data64[1][frame] : inL;
 
-            float outL = 0.0f;
-            float outR = 0.0f;
-            processSample(inL, inR, outL, outR);
+                double outL = 0.0;
+                double outR = 0.0;
 
-            output.data32[0][frame] = outL;
-            if (output.channel_count > 1) {
-                output.data32[1][frame] = outR;
+                delayProcessor_.processSample(
+                    inL,
+                    inR,
+                    outL,
+                    outR,
+                    currentDelayParameters()
+                );
+
+                output.data64[0][frame] = outL;
+
+                if (output.channel_count > 1) {
+                    output.data64[1][frame] = outR;
+                }
             }
-        }
+        );
+
+        return CLAP_PROCESS_CONTINUE;
     }
 
     return CLAP_PROCESS_CONTINUE;
@@ -434,7 +420,9 @@ bool DelayPlugin::audioPortsInfo(uint32_t index, bool isInput, clap_audio_port_i
     info->id = AudioPortId;
     std::snprintf(info->name, sizeof(info->name), "%s", isInput ? "Stereo In" : "Stereo Out");
     info->channel_count = 2;
-    info->flags = CLAP_AUDIO_PORT_IS_MAIN;
+    info->flags = CLAP_AUDIO_PORT_IS_MAIN
+                | CLAP_AUDIO_PORT_SUPPORTS_64BITS
+                | CLAP_AUDIO_PORT_PREFERS_64BITS;
     info->port_type = CLAP_PORT_STEREO;
     info->in_place_pair = CLAP_INVALID_ID;
     return true;
@@ -573,6 +561,71 @@ bool DelayPlugin::stateLoad(const clap_istream_t* stream) noexcept {
     return true;
 }
 
+void DelayPlugin::handleEvent(const clap_event_header_t* event) noexcept {
+    if (!event) {
+        return;
+    }
+
+    if (event->space_id == CLAP_CORE_EVENT_SPACE_ID &&
+        (event->type == CLAP_EVENT_PARAM_VALUE || event->type == CLAP_EVENT_PARAM_MOD)) {
+        const auto* paramEvent = reinterpret_cast<const clap_event_param_value_t*>(event);
+        setParameter(paramEvent->param_id, paramEvent->value);
+    }
+}
+
+void DelayPlugin::setParameter(clap_id id, double value) noexcept {
+    const double clamped = clampToParameterRange(id, value);
+
+    switch (id) {
+        case ParamBypass:
+            bypass_.store(clamped, std::memory_order_relaxed);
+            break;
+        case ParamDelayMs:
+            delayMs_.store(clamped, std::memory_order_relaxed);
+            break;
+        case ParamFeedback:
+            feedback_.store(clamped, std::memory_order_relaxed);
+            break;
+        case ParamMix:
+            mix_.store(clamped, std::memory_order_relaxed);
+            break;
+        case ParamOutputDb:
+            outputDb_.store(clamped, std::memory_order_relaxed);
+            break;
+        default:
+            break;
+    }
+}
+
+double DelayPlugin::getParameter(clap_id id) const noexcept {
+    switch (id) {
+        case ParamBypass:
+            return bypass_.load(std::memory_order_relaxed);
+        case ParamDelayMs:
+            return delayMs_.load(std::memory_order_relaxed);
+        case ParamFeedback:
+            return feedback_.load(std::memory_order_relaxed);
+        case ParamMix:
+            return mix_.load(std::memory_order_relaxed);
+        case ParamOutputDb:
+            return outputDb_.load(std::memory_order_relaxed);
+        default:
+            return 0.0;
+    }
+}
+
+DelayParameters DelayPlugin::currentDelayParameters() const noexcept {
+    DelayParameters params {};
+
+    params.bypassed = bypass_.load(std::memory_order_relaxed) >= 0.5;
+    params.delayMs = delayMs_.load(std::memory_order_relaxed);
+    params.feedback = feedback_.load(std::memory_order_relaxed);
+    params.mix = mix_.load(std::memory_order_relaxed);
+    params.outputDb = outputDb_.load(std::memory_order_relaxed);
+
+    return params;
+}
+
 bool DelayPlugin::clapInit(const clap_plugin_t* plugin) noexcept {
     return from(plugin).init();
 }
@@ -585,7 +638,6 @@ bool DelayPlugin::clapActivate(const clap_plugin_t* plugin,
                                double sampleRate,
                                uint32_t minFrameCount,
                                uint32_t maxFrameCount) noexcept {
-    (void)minFrameCount;
     return from(plugin).activate(sampleRate, minFrameCount, maxFrameCount);
 }
 
