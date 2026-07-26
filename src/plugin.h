@@ -137,6 +137,7 @@ private:
     std::atomic<double> feedback_ {0.35};
     std::atomic<double> mix_ {0.35};
     std::atomic<double> outputDb_ {0.0};
+    std::atomic<double> dspComplexity_ {0.0};
 };
 
 const clap_plugin_t* createDelayPlugin(const clap_host_t* host) noexcept;

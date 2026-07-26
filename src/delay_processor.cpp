@@ -30,6 +30,7 @@ bool DelayProcessor::prepare(double sampleRate, uint32_t maxFrameCount) noexcept
 
     writePositionFloat_ = 0;
     writePositionDouble_ = 0;
+    workloadSink_ = 0.0;
 
     return true;
 }
@@ -44,6 +45,7 @@ void DelayProcessor::release() noexcept {
     delayBufferSize_ = 0;
     writePositionFloat_ = 0;
     writePositionDouble_ = 0;
+    workloadSink_ = 0.0;
 }
 
 void DelayProcessor::reset() noexcept {
@@ -55,6 +57,7 @@ void DelayProcessor::reset() noexcept {
 
     writePositionFloat_ = 0;
     writePositionDouble_ = 0;
+    workloadSink_ = 0.0;
 }
 
 uint32_t DelayProcessor::computeDelaySamples(double delayMs) const noexcept {
@@ -82,6 +85,26 @@ double DelayProcessor::dbToGainDouble(double db) noexcept {
     return std::pow(10.0, db / 20.0);
 }
 
+void DelayProcessor::runArtificialWorkload(double input, double dspComplexity) noexcept {
+    const double clampedComplexity = std::clamp(dspComplexity, 0.0, 100.0);
+    const int iterations = static_cast<int>(std::llround(clampedComplexity * 2.0));
+
+    if (iterations <= 0) {
+        return;
+    }
+
+    // This workload is intentionally independent from the audible output.
+    // It is only used to create a controlled increase in processing time
+    // for real-time performance measurements.
+    double x = input + workloadSink_ * 0.000001;
+
+    for (int i = 0; i < iterations; ++i) {
+        x = std::sin(x + static_cast<double>(i) * 0.000001);
+    }
+
+    workloadSink_ = x;
+}
+
 void DelayProcessor::processSample(float inL,
                                    float inR,
                                    float& outL,
@@ -92,6 +115,9 @@ void DelayProcessor::processSample(float inL,
         outR = inR;
         return;
     }
+
+    runArtificialWorkload((static_cast<double>(inL) + static_cast<double>(inR)) * 0.5,
+                          params.dspComplexity);
 
     const uint32_t delaySamples = computeDelaySamples(params.delayMs);
 
@@ -136,6 +162,8 @@ void DelayProcessor::processSample(double inL,
         outR = inR;
         return;
     }
+
+    runArtificialWorkload((inL + inR) * 0.5, params.dspComplexity);
 
     const uint32_t delaySamples = computeDelaySamples(params.delayMs);
 

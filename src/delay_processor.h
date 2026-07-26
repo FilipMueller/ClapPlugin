@@ -40,6 +40,8 @@ private:
     static float dbToGainFloat(double db) noexcept;
     static double dbToGainDouble(double db) noexcept;
 
+    void runArtificialWorkload(double input, double dspComplexity) noexcept;
+
     double sampleRate_ = 44100.0;
     uint32_t delayBufferSize_ = 0;
 
@@ -50,4 +52,7 @@ private:
     std::vector<double> delayBufferDoubleL_;
     std::vector<double> delayBufferDoubleR_;
     uint32_t writePositionDouble_ = 0;
+
+    // Used only to make sure the artificial workload cannot be optimized away.
+    volatile double workloadSink_ = 0.0;
 };

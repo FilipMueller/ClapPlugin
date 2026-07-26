@@ -112,7 +112,8 @@ void MetricsCsvLogger::writeHeader(std::ofstream& file) {
         << "delay_ms,"
         << "delay_samples,"
         << "feedback,"
-        << "mix"
+        << "mix,"
+        << "dsp_complexity"
         << '\n';
 }
 
@@ -136,6 +137,7 @@ void MetricsCsvLogger::writeRow(std::ofstream& file,
         << "delay_ms=" << snapshot.delayMs << "; "
         << "delay_samples=" << snapshot.delaySamples << "; "
         << "feedback=" << snapshot.feedback << "; "
-        << "mix=" << snapshot.mix
+        << "mix=" << snapshot.mix << "; "
+        << "dsp_complexity=" << snapshot.dspComplexity
         << '\n';
 }

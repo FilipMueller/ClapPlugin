@@ -25,6 +25,7 @@ struct RealtimeMetricsSnapshot {
     uint32_t delaySamples = 0;
     double feedback = 0.0;
     double mix = 0.0;
+    double dspComplexity = 0.0;
 };
 
 class RealtimeMetrics {
@@ -55,6 +56,7 @@ public:
         delaySamples_.store(0);
         feedback_.store(0.0);
         mix_.store(0.0);
+        dspComplexity_.store(0.0);
     }
 
     void configure(double sampleRate,
@@ -85,11 +87,13 @@ public:
     void updateDelayParameters(double delayMs,
                                uint32_t delaySamples,
                                double feedback,
-                               double mix) noexcept {
+                               double mix,
+                               double dspComplexity) noexcept {
         delayMs_.store(delayMs);
         delaySamples_.store(delaySamples);
         feedback_.store(feedback);
         mix_.store(mix);
+        dspComplexity_.store(dspComplexity);
     }
 
     void recordProcessTime(double processTimeMs) noexcept {
@@ -128,6 +132,7 @@ public:
         s.delaySamples = delaySamples_.load();
         s.feedback = feedback_.load();
         s.mix = mix_.load();
+        s.dspComplexity = dspComplexity_.load();
 
         return s;
     }
@@ -205,4 +210,5 @@ private:
     std::atomic<uint32_t> delaySamples_ {0};
     std::atomic<double> feedback_ {0.0};
     std::atomic<double> mix_ {0.0};
+    std::atomic<double> dspComplexity_ {0.0};
 };

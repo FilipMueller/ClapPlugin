@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <new>
@@ -19,7 +20,7 @@
 namespace {
 constexpr uint32_t AudioPortId = 0;
 constexpr uint32_t StateMagic = 0x46444C59; // 'FDLY'
-constexpr uint32_t StateVersion = 1;
+constexpr uint32_t StateVersion = 2;
 
 struct DelayState {
     uint32_t magic;
@@ -29,6 +30,7 @@ struct DelayState {
     double feedback;
     double mix;
     double outputDb;
+    double dspComplexity;
 };
 
 const clap_plugin_audio_ports_t audioPortsExtension {
@@ -85,6 +87,13 @@ constexpr DelayPlugin::ParameterDefinition parameterDefinitions[] {
      "Output",
      -24.0,
      12.0,
+     0.0,
+     CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_REQUIRES_PROCESS},
+    {DelayPlugin::ParamDspComplexity,
+     "DSP Complexity",
+     "Analysis",
+     0.0,
+     100.0,
      0.0,
      CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_REQUIRES_PROCESS},
 };
@@ -264,7 +273,8 @@ bool DelayPlugin::activate(double sampleRate, uint32_t, uint32_t maxFrameCount) 
         params.delayMs,
         delayProcessor_.computeDelaySamples(params.delayMs),
         params.feedback,
-        params.mix
+        params.mix,
+        params.dspComplexity
     );
 
     metricsLogger_.start(metrics_);
@@ -316,7 +326,8 @@ clap_process_status DelayPlugin::process(const clap_process_t* process) noexcept
         paramsForMetrics.delayMs,
         delayProcessor_.computeDelaySamples(paramsForMetrics.delayMs),
         paramsForMetrics.feedback,
-        paramsForMetrics.mix
+        paramsForMetrics.mix,
+        paramsForMetrics.dspComplexity
     );
 
     if (input.data32 && output.data32) {
@@ -478,6 +489,9 @@ bool DelayPlugin::paramsValueToText(clap_id paramId, double value, char* display
         case ParamOutputDb:
             std::snprintf(display, size, "%.1f dB", clamped);
             return true;
+        case ParamDspComplexity:
+            std::snprintf(display, size, "%.1f %%", clamped);
+            return true;
         default:
             return false;
     }
@@ -538,6 +552,7 @@ bool DelayPlugin::stateSave(const clap_ostream_t* stream) const noexcept {
         feedback_.load(std::memory_order_relaxed),
         mix_.load(std::memory_order_relaxed),
         outputDb_.load(std::memory_order_relaxed),
+        dspComplexity_.load(std::memory_order_relaxed),
     };
 
     return writeBytes(stream, &state, sizeof(state));
@@ -558,6 +573,7 @@ bool DelayPlugin::stateLoad(const clap_istream_t* stream) noexcept {
     setParameter(ParamFeedback, state.feedback);
     setParameter(ParamMix, state.mix);
     setParameter(ParamOutputDb, state.outputDb);
+    setParameter(ParamDspComplexity, state.dspComplexity);
     return true;
 }
 
@@ -592,6 +608,9 @@ void DelayPlugin::setParameter(clap_id id, double value) noexcept {
         case ParamOutputDb:
             outputDb_.store(clamped, std::memory_order_relaxed);
             break;
+        case ParamDspComplexity:
+            dspComplexity_.store(clamped, std::memory_order_relaxed);
+            break;
         default:
             break;
     }
@@ -609,6 +628,8 @@ double DelayPlugin::getParameter(clap_id id) const noexcept {
             return mix_.load(std::memory_order_relaxed);
         case ParamOutputDb:
             return outputDb_.load(std::memory_order_relaxed);
+        case ParamDspComplexity:
+            return dspComplexity_.load(std::memory_order_relaxed);
         default:
             return 0.0;
     }
@@ -622,6 +643,7 @@ DelayParameters DelayPlugin::currentDelayParameters() const noexcept {
     params.feedback = feedback_.load(std::memory_order_relaxed);
     params.mix = mix_.load(std::memory_order_relaxed);
     params.outputDb = outputDb_.load(std::memory_order_relaxed);
+    params.dspComplexity = dspComplexity_.load(std::memory_order_relaxed);
 
     return params;
 }
