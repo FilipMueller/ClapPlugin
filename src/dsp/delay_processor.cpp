@@ -3,6 +3,22 @@
 #include <algorithm>
 #include <cmath>
 
+uint32_t DelayProcessor::nextPowerOfTwo(uint32_t value) noexcept {
+    if (value <= 2u) {
+        return 2u;
+    }
+
+    --value;
+    value |= value >> 1;
+    value |= value >> 2;
+    value |= value >> 4;
+    value |= value >> 8;
+    value |= value >> 16;
+    ++value;
+
+    return value;
+}
+
 bool DelayProcessor::prepare(double sampleRate, uint32_t maxFrameCount) noexcept {
     if (sampleRate <= 0.0 || maxFrameCount == 0) {
         return false;
@@ -11,11 +27,11 @@ bool DelayProcessor::prepare(double sampleRate, uint32_t maxFrameCount) noexcept
     sampleRate_ = sampleRate;
 
     const auto requestedSize =
-        static_cast<uint32_t>(std::ceil(sampleRate_ * maxDelaySeconds_))
-        + maxFrameCount
-        + 1;
+        static_cast<uint32_t>(std::ceil(sampleRate_ * maxDelaySeconds_)) +
+        maxFrameCount + 1;
 
-    delayBufferSize_ = std::max<uint32_t>(requestedSize, 2);
+    delayBufferSize_ = nextPowerOfTwo(requestedSize);
+    delayBufferMask_ = delayBufferSize_ - 1;
 
     try {
         delayBufferFloatL_.assign(delayBufferSize_, 0.0f);
@@ -43,6 +59,7 @@ void DelayProcessor::release() noexcept {
     delayBufferDoubleR_.clear();
 
     delayBufferSize_ = 0;
+    delayBufferMask_ = 0;
     writePositionFloat_ = 0;
     writePositionDouble_ = 0;
     workloadSink_ = 0.0;
@@ -65,16 +82,10 @@ uint32_t DelayProcessor::computeDelaySamples(double delayMs) const noexcept {
         return 1;
     }
 
-    const auto delaySamples =
-        std::llround((delayMs / 1000.0) * sampleRate_);
+    const auto delaySamples = std::llround((delayMs / 1000.0) * sampleRate_);
 
     return static_cast<uint32_t>(
-        std::clamp(
-            delaySamples,
-            1LL,
-            static_cast<long long>(delayBufferSize_ - 1)
-        )
-    );
+        std::clamp(delaySamples, 1LL, static_cast<long long>(delayBufferSize_ - 1)));
 }
 
 float DelayProcessor::dbToGainFloat(double db) noexcept {
@@ -85,17 +96,34 @@ double DelayProcessor::dbToGainDouble(double db) noexcept {
     return std::pow(10.0, db / 20.0);
 }
 
-void DelayProcessor::runArtificialWorkload(double input, double dspComplexity) noexcept {
-    const double clampedComplexity = std::clamp(dspComplexity, 0.0, 100.0);
-    const int iterations = static_cast<int>(std::llround(clampedComplexity * 2.0));
+DelayCoefficients DelayProcessor::makeCoefficients(
+    const DelayParameters& params) const noexcept {
+    DelayCoefficients coefficients;
 
+    coefficients.bypassed = params.bypassed;
+    coefficients.delaySamples = computeDelaySamples(params.delayMs);
+    coefficients.dspComplexity = std::clamp(params.dspComplexity, 0.0, 100.0);
+    coefficients.workloadIterations =
+        static_cast<int>(std::llround(coefficients.dspComplexity * 2.0));
+
+    const double gain = dbToGainDouble(params.outputDb);
+
+    coefficients.feedbackD = params.feedback;
+    coefficients.mixD = params.mix;
+    coefficients.gainD = gain;
+
+    coefficients.feedbackF = static_cast<float>(params.feedback);
+    coefficients.mixF = static_cast<float>(params.mix);
+    coefficients.gainF = static_cast<float>(gain);
+
+    return coefficients;
+}
+
+void DelayProcessor::runArtificialWorkload(double input, int iterations) noexcept {
     if (iterations <= 0) {
         return;
     }
 
-    // This workload is intentionally independent from the audible output.
-    // It is only used to create a controlled increase in processing time
-    // for real-time performance measurements.
     double x = input + workloadSink_ * 0.000001;
 
     for (int i = 0; i < iterations; ++i) {
@@ -109,7 +137,7 @@ void DelayProcessor::processSample(float inL,
                                    float inR,
                                    float& outL,
                                    float& outR,
-                                   const DelayParameters& params) noexcept {
+                                   const DelayCoefficients& coefficients) noexcept {
     if (delayBufferSize_ == 0) {
         outL = inL;
         outR = inR;
@@ -117,81 +145,69 @@ void DelayProcessor::processSample(float inL,
     }
 
     runArtificialWorkload((static_cast<double>(inL) + static_cast<double>(inR)) * 0.5,
-                          params.dspComplexity);
-
-    const uint32_t delaySamples = computeDelaySamples(params.delayMs);
+                          coefficients.workloadIterations);
 
     const uint32_t readPosition =
-        (writePositionFloat_ + delayBufferSize_ - delaySamples) % delayBufferSize_;
+        (writePositionFloat_ - coefficients.delaySamples) & delayBufferMask_;
 
     const float delayedL = delayBufferFloatL_[readPosition];
     const float delayedR = delayBufferFloatR_[readPosition];
 
-    if (params.bypassed) {
+    if (coefficients.bypassed) {
         outL = inL;
         outR = inR;
 
         delayBufferFloatL_[writePositionFloat_] = inL;
         delayBufferFloatR_[writePositionFloat_] = inR;
     } else {
-        const float feedback = static_cast<float>(params.feedback);
-        const float mix = static_cast<float>(params.mix);
-        const float gain = dbToGainFloat(params.outputDb);
+        delayBufferFloatL_[writePositionFloat_] = inL + delayedL * coefficients.feedbackF;
+        delayBufferFloatR_[writePositionFloat_] = inR + delayedR * coefficients.feedbackF;
 
-        delayBufferFloatL_[writePositionFloat_] = inL + delayedL * feedback;
-        delayBufferFloatR_[writePositionFloat_] = inR + delayedR * feedback;
-
-        outL = ((1.0f - mix) * inL + mix * delayedL) * gain;
-        outR = ((1.0f - mix) * inR + mix * delayedR) * gain;
+        outL = ((1.0f - coefficients.mixF) * inL + coefficients.mixF * delayedL) *
+               coefficients.gainF;
+        outR = ((1.0f - coefficients.mixF) * inR + coefficients.mixF * delayedR) *
+               coefficients.gainF;
     }
 
-    ++writePositionFloat_;
-
-    if (writePositionFloat_ >= delayBufferSize_) {
-        writePositionFloat_ = 0;
-    }
+    writePositionFloat_ = (writePositionFloat_ + 1) & delayBufferMask_;
 }
 
 void DelayProcessor::processSample(double inL,
                                    double inR,
                                    double& outL,
                                    double& outR,
-                                   const DelayParameters& params) noexcept {
+                                   const DelayCoefficients& coefficients) noexcept {
     if (delayBufferSize_ == 0) {
         outL = inL;
         outR = inR;
         return;
     }
 
-    runArtificialWorkload((inL + inR) * 0.5, params.dspComplexity);
-
-    const uint32_t delaySamples = computeDelaySamples(params.delayMs);
+    runArtificialWorkload((inL + inR) * 0.5, coefficients.workloadIterations);
 
     const uint32_t readPosition =
-        (writePositionDouble_ + delayBufferSize_ - delaySamples) % delayBufferSize_;
+        (writePositionDouble_ - coefficients.delaySamples) & delayBufferMask_;
 
     const double delayedL = delayBufferDoubleL_[readPosition];
     const double delayedR = delayBufferDoubleR_[readPosition];
 
-    if (params.bypassed) {
+    if (coefficients.bypassed) {
         outL = inL;
         outR = inR;
 
         delayBufferDoubleL_[writePositionDouble_] = inL;
         delayBufferDoubleR_[writePositionDouble_] = inR;
     } else {
-        const double gain = dbToGainDouble(params.outputDb);
+        delayBufferDoubleL_[writePositionDouble_] =
+            inL + delayedL * coefficients.feedbackD;
+        delayBufferDoubleR_[writePositionDouble_] =
+            inR + delayedR * coefficients.feedbackD;
 
-        delayBufferDoubleL_[writePositionDouble_] = inL + delayedL * params.feedback;
-        delayBufferDoubleR_[writePositionDouble_] = inR + delayedR * params.feedback;
-
-        outL = ((1.0 - params.mix) * inL + params.mix * delayedL) * gain;
-        outR = ((1.0 - params.mix) * inR + params.mix * delayedR) * gain;
+        outL = ((1.0 - coefficients.mixD) * inL + coefficients.mixD * delayedL) *
+               coefficients.gainD;
+        outR = ((1.0 - coefficients.mixD) * inR + coefficients.mixD * delayedR) *
+               coefficients.gainD;
     }
 
-    ++writePositionDouble_;
-
-    if (writePositionDouble_ >= delayBufferSize_) {
-        writePositionDouble_ = 0;
-    }
+    writePositionDouble_ = (writePositionDouble_ + 1) & delayBufferMask_;
 }

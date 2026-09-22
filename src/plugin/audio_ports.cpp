@@ -13,7 +13,10 @@ uint32_t AudioPorts::count(bool) noexcept {
     return 1;
 }
 
-bool AudioPorts::info(uint32_t index, bool isInput, clap_audio_port_info_t* info) noexcept {
+bool AudioPorts::info(uint32_t index,
+                      bool isInput,
+                      bool allow64Bits,
+                      clap_audio_port_info_t* info) noexcept {
     if (!info || index != 0) {
         return false;
     }
@@ -23,8 +26,12 @@ bool AudioPorts::info(uint32_t index, bool isInput, clap_audio_port_info_t* info
     std::snprintf(info->name, sizeof(info->name), "%s", isInput ? "Stereo In" : "Stereo Out");
     info->channel_count = 2;
     info->flags = CLAP_AUDIO_PORT_IS_MAIN
-                | CLAP_AUDIO_PORT_SUPPORTS_64BITS
-                | CLAP_AUDIO_PORT_PREFERS_64BITS;
+                | CLAP_AUDIO_PORT_REQUIRES_COMMON_SAMPLE_SIZE;
+
+    if (allow64Bits) {
+        info->flags |= CLAP_AUDIO_PORT_SUPPORTS_64BITS
+                     | CLAP_AUDIO_PORT_PREFERS_64BITS;
+    }
     info->port_type = CLAP_PORT_STEREO;
     info->in_place_pair = CLAP_INVALID_ID;
     return true;

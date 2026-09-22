@@ -43,14 +43,6 @@ const void* DelayPlugin::getExtension(const char* id) noexcept {
     return nullptr;
 }
 
-uint32_t DelayPlugin::audioPortsCount(bool isInput) const noexcept {
-    return AudioPorts::count(isInput);
-}
-
-bool DelayPlugin::audioPortsInfo(uint32_t index, bool isInput, clap_audio_port_info_t* info) const noexcept {
-    return AudioPorts::info(index, isInput, info);
-}
-
 uint32_t DelayPlugin::paramsCount() const noexcept {
     return ParameterManager::count();
 }
@@ -73,6 +65,7 @@ bool DelayPlugin::paramsTextToValue(clap_id paramId, const char* display, double
 
 void DelayPlugin::paramsFlush(const clap_input_events_t* in, const clap_output_events_t*) noexcept {
     parameters_.flush(in);
+    applySampleFormatIfInactive();
 }
 
 bool DelayPlugin::stateSave(const clap_ostream_t* stream) const noexcept {
@@ -80,5 +73,10 @@ bool DelayPlugin::stateSave(const clap_ostream_t* stream) const noexcept {
 }
 
 bool DelayPlugin::stateLoad(const clap_istream_t* stream) noexcept {
-    return StateSerializer::load(stream, parameters_);
+    if (!StateSerializer::load(stream, parameters_)) {
+        return false;
+    }
+
+    applySampleFormatIfInactive();
+    return true;
 }

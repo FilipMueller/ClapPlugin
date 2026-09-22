@@ -3,8 +3,8 @@
 #include <cstdint>
 
 namespace {
-constexpr uint32_t StateMagic = 0x46444C59; // 'FDLY'
-constexpr uint32_t StateVersion = 2;
+constexpr uint32_t StateMagic = 0x46444C59;
+constexpr uint32_t StateVersion = 4;
 
 struct PersistedDelayState {
     uint32_t magic;
@@ -15,6 +15,8 @@ struct PersistedDelayState {
     double mix;
     double outputDb;
     double dspComplexity;
+    double runMarker;
+    double sampleFormat;
 };
 
 bool writeBytes(const clap_ostream_t* stream, const void* data, uint64_t size) noexcept {
@@ -63,6 +65,8 @@ bool StateSerializer::save(const clap_ostream_t* stream, const ParameterManager&
         params.mix,
         params.outputDb,
         params.dspComplexity,
+        params.runMarker,
+        params.sampleFormat,
     };
 
     return writeBytes(stream, &state, sizeof(state));
@@ -87,6 +91,8 @@ bool StateSerializer::load(const clap_istream_t* stream, ParameterManager& param
     params.mix = state.mix;
     params.outputDb = state.outputDb;
     params.dspComplexity = state.dspComplexity;
+    params.runMarker = state.runMarker;
+    params.sampleFormat = state.sampleFormat;
     parameters.setState(params);
     return true;
 }

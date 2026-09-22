@@ -15,6 +15,8 @@ struct DelayParameterState {
     double mix = 0.35;
     double outputDb = 0.0;
     double dspComplexity = 0.0;
+    double runMarker = 0.0;
+    double sampleFormat = 0.0;
 };
 
 class ParameterManager {
@@ -26,6 +28,8 @@ public:
         ParamMix = 3,
         ParamOutputDb = 4,
         ParamDspComplexity = 5,
+        ParamRunMarker = 6,
+        ParamSampleFormat = 7,
     };
 
     struct Definition {
@@ -64,4 +68,6 @@ private:
     std::atomic<double> mix_ {0.35};
     std::atomic<double> outputDb_ {0.0};
     std::atomic<double> dspComplexity_ {0.0};
+    std::atomic<double> runMarker_ {0.0};
+    std::atomic<double> sampleFormat_ {0.0};
 };

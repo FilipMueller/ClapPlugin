@@ -1,13 +1,80 @@
 #include "plugin/parameter_manager.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
 
 #include <clap/ext/params.h>
+
+namespace {
+
+bool parseNumber(const char* text, double& out) noexcept {
+    if (!text) {
+        return false;
+    }
+
+    char buffer[64] {};
+    std::size_t length = 0;
+    bool seenDigit = false;
+    bool seenSeparator = false;
+
+    for (const char* p = text; *p != '\0' && length + 1 < sizeof(buffer); ++p) {
+        const unsigned char c = static_cast<unsigned char>(*p);
+
+        if (std::isspace(c)) {
+            if (seenDigit) {
+                break;
+            }
+            continue;
+        }
+
+        if (c == '.' || c == ',') {
+            if (seenSeparator) {
+                break;
+            }
+            seenSeparator = true;
+            buffer[length++] = '.';
+            continue;
+        }
+
+        if (c == '+' || c == '-') {
+            if (length != 0) {
+                break;
+            }
+            buffer[length++] = static_cast<char>(c);
+            continue;
+        }
+
+        if (std::isdigit(c)) {
+            seenDigit = true;
+            buffer[length++] = static_cast<char>(c);
+            continue;
+        }
+
+        break;
+    }
+
+    if (!seenDigit) {
+        return false;
+    }
+
+    char* end = nullptr;
+    const double parsed = std::strtod(buffer, &end);
+
+    if (end == buffer || !std::isfinite(parsed)) {
+        return false;
+    }
+
+    out = parsed;
+    return true;
+}
+
+}
 
 namespace {
 constexpr ParameterManager::Definition parameterDefinitions[] {
@@ -53,7 +120,23 @@ constexpr ParameterManager::Definition parameterDefinitions[] {
      0.0,
      100.0,
      0.0,
-     CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_REQUIRES_PROCESS},
+     CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_AUTOMATABLE | CLAP_PARAM_REQUIRES_PROCESS},
+
+    {ParameterManager::ParamRunMarker,
+     "Run Marker",
+     "Analysis",
+     0.0,
+     999.0,
+     0.0,
+     CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_AUTOMATABLE},
+
+    {ParameterManager::ParamSampleFormat,
+     "Sample Format",
+     "Analysis",
+     0.0,
+     1.0,
+     0.0,
+     CLAP_PARAM_IS_STEPPED | CLAP_PARAM_IS_AUTOMATABLE},
 };
 } // namespace
 
@@ -125,7 +208,13 @@ bool ParameterManager::valueToText(clap_id id, double value, char* display, uint
             std::snprintf(display, size, "%.1f dB", clamped);
             return true;
         case ParamDspComplexity:
-            std::snprintf(display, size, "%.1f %%", clamped);
+            std::snprintf(display, size, "%.0f %%", clamped);
+            return true;
+        case ParamRunMarker:
+            std::snprintf(display, size, "Run %d", static_cast<int>(clamped));
+            return true;
+        case ParamSampleFormat:
+            std::snprintf(display, size, "%s", clamped >= 0.5 ? "32-bit" : "64-bit");
             return true;
         default:
             return false;
@@ -135,6 +224,16 @@ bool ParameterManager::valueToText(clap_id id, double value, char* display, uint
 bool ParameterManager::textToValue(clap_id id, const char* display, double* value) const noexcept {
     if (!display || !value || !find(id)) {
         return false;
+    }
+
+    if (id == ParamSampleFormat) {
+        double parsedFormat = 0.0;
+        if (parseNumber(display, parsedFormat)) {
+            if (parsedFormat >= 32.0) {
+                *value = parsedFormat >= 48.0 ? 0.0 : 1.0;
+                return true;
+            }
+        }
     }
 
     if (id == ParamBypass) {
@@ -148,9 +247,8 @@ bool ParameterManager::textToValue(clap_id id, const char* display, double* valu
         }
     }
 
-    char* end = nullptr;
-    const double parsed = std::strtod(display, &end);
-    if (end == display) {
+    double parsed = 0.0;
+    if (!parseNumber(display, parsed)) {
         return false;
     }
 
@@ -208,6 +306,12 @@ void ParameterManager::set(clap_id id, double value) noexcept {
         case ParamDspComplexity:
             dspComplexity_.store(clamped, std::memory_order_relaxed);
             break;
+        case ParamRunMarker:
+            runMarker_.store(clamped, std::memory_order_relaxed);
+            break;
+        case ParamSampleFormat:
+            sampleFormat_.store(clamped, std::memory_order_relaxed);
+            break;
         default:
             break;
     }
@@ -227,6 +331,10 @@ double ParameterManager::get(clap_id id) const noexcept {
             return outputDb_.load(std::memory_order_relaxed);
         case ParamDspComplexity:
             return dspComplexity_.load(std::memory_order_relaxed);
+        case ParamRunMarker:
+            return runMarker_.load(std::memory_order_relaxed);
+        case ParamSampleFormat:
+            return sampleFormat_.load(std::memory_order_relaxed);
         default:
             return 0.0;
     }
@@ -251,6 +359,8 @@ DelayParameterState ParameterManager::state() const noexcept {
     state.mix = mix_.load(std::memory_order_relaxed);
     state.outputDb = outputDb_.load(std::memory_order_relaxed);
     state.dspComplexity = dspComplexity_.load(std::memory_order_relaxed);
+    state.runMarker = runMarker_.load(std::memory_order_relaxed);
+    state.sampleFormat = sampleFormat_.load(std::memory_order_relaxed);
     return state;
 }
 
@@ -261,4 +371,6 @@ void ParameterManager::setState(const DelayParameterState& state) noexcept {
     set(ParamMix, state.mix);
     set(ParamOutputDb, state.outputDb);
     set(ParamDspComplexity, state.dspComplexity);
+    set(ParamRunMarker, state.runMarker);
+    set(ParamSampleFormat, state.sampleFormat);
 }

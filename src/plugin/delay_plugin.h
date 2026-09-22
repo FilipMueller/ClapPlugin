@@ -6,9 +6,10 @@
 #include "metrics/realtime_metrics.h"
 #include "plugin/parameter_manager.h"
 
-#include <cstdint>
+#include <atomic>
 
 #include <clap/clap.h>
+#include <clap/ext/audio-ports.h>
 
 class DelayPlugin {
 public:
@@ -99,6 +100,23 @@ private:
     void updateMetricsForCurrentParameters() noexcept;
     void handleEvent(const clap_event_header_t* event) noexcept;
 
+    // Starts a new measurement run when the Run Marker parameter changed.
+    // [audio-thread] — resets atomics only, no allocation or locking.
+    void syncRunMarker() noexcept;
+
+    void syncSampleFormat() noexcept;
+
+    void applySampleFormatIfInactive() noexcept;
+
+    bool advertise64Bits() const noexcept;
+
+    template <typename SampleType>
+    void processBuffers(const clap_process_t* process,
+                        const clap_audio_buffer_t& input,
+                        clap_audio_buffer_t& output,
+                        SampleType** inputData,
+                        SampleType** outputData) noexcept;
+
 private:
     clap_plugin_t plugin_{};
     const clap_host_t* host_{};
@@ -106,6 +124,15 @@ private:
     double sampleRate_ = 44100.0;
     uint32_t maxFrameCount_ = 0;
     bool active_ = false;
+
+    uint32_t lastRunMarker_ = 0;
+
+    const clap_host_audio_ports_t* hostAudioPorts_ = nullptr;
+    bool lastAdvertise64Bits_ = true;
+    std::atomic<bool> portFlagsChangePending_ {false};
+
+    bool sampleFormatPinned_ = false;
+    bool pinnedAdvertise64Bits_ = true;
 
     ParameterManager parameters_;
     DelayProcessor delayProcessor_;

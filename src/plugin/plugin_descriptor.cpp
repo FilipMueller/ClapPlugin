@@ -15,14 +15,14 @@ const clap_plugin_descriptor_t* DelayPlugin::descriptor() noexcept {
 
     static const clap_plugin_descriptor_t desc {
         CLAP_VERSION_INIT,
-        "de.filipmueller.filip-delay",
-        "Filip Delay",
+        "de.filipmueller.delay",
+        "Delay",
         "Filip Mueller",
         "",
         "",
         "",
-#ifdef FILIP_DELAY_VERSION
-        FILIP_DELAY_VERSION,
+#ifdef DELAY_VERSION
+        DELAY_VERSION,
 #else
         "0.1.0",
 #endif

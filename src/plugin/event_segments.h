@@ -6,57 +6,65 @@
 #include <clap/clap.h>
 #include <clap/events.h>
 
-template <typename HandleEvent, typename ProcessFrame>
+// Splits one process() block at every event timestamp and hands the resulting
+// segments to the caller.
+//
+// The callback takes a half-open frame range [begin, end) rather than a single
+// frame. That is what allows the caller to derive its DSP coefficients once per
+// segment instead of once per sample, which is the whole point of the split:
+// parameter values cannot change inside a segment by definition, because a
+// segment is bounded by the events that would change them.
+//
+// handleEvent(const clap_event_header_t*) is invoked for every event, in the
+// sample-sorted order the host guarantees. Events timestamped at or beyond the
+// end of the block are still delivered, so that parameter state stays correct
+// for the next block.
+
+template <typename HandleEvent, typename ProcessRange>
 void processByEventSegments(const clap_process_t* process,
                             HandleEvent&& handleEvent,
-                            ProcessFrame&& processFrame) noexcept {
+                            ProcessRange&& processRange) noexcept {
     const uint32_t frames = process->frames_count;
-    const uint32_t eventCount = process->in_events ? process->in_events->size(process->in_events) : 0;
+    const clap_input_events_t* in = process->in_events;
+    const uint32_t eventCount = in ? in->size(in) : 0;
+
     uint32_t eventIndex = 0;
-    uint32_t nextEventFrame = 0;
+    uint32_t frame = 0;
 
-    while (eventIndex < eventCount) {
-        const clap_event_header_t* event = process->in_events->get(process->in_events, eventIndex);
-        if (event && event->time == 0) {
-            handleEvent(event);
-            ++eventIndex;
-        } else {
-            nextEventFrame = event ? std::min<uint32_t>(event->time, frames) : frames;
-            break;
-        }
-    }
+    while (frame < frames) {
+        while (eventIndex < eventCount) {
+            const clap_event_header_t* event = in->get(in, eventIndex);
 
-    if (eventIndex >= eventCount) {
-        nextEventFrame = frames;
-    }
-
-    for (uint32_t frame = 0; frame < frames;) {
-        while (eventIndex < eventCount && nextEventFrame == frame) {
-            const clap_event_header_t* event = process->in_events->get(process->in_events, eventIndex);
             if (!event) {
                 ++eventIndex;
                 continue;
             }
 
-            if (event->time != frame) {
-                nextEventFrame = std::min<uint32_t>(event->time, frames);
+            if (event->time > frame) {
                 break;
             }
 
             handleEvent(event);
             ++eventIndex;
+        }
 
-            if (eventIndex < eventCount) {
-                const clap_event_header_t* nextEvent = process->in_events->get(process->in_events, eventIndex);
-                nextEventFrame = nextEvent ? std::min<uint32_t>(nextEvent->time, frames) : frames;
-            } else {
-                nextEventFrame = frames;
+        uint32_t segmentEnd = frames;
+
+        if (eventIndex < eventCount) {
+            const clap_event_header_t* next = in->get(in, eventIndex);
+            if (next) {
+                segmentEnd = std::min<uint32_t>(next->time, frames);
             }
         }
 
-        const uint32_t endFrame = std::max(frame + 1, nextEventFrame);
-        for (; frame < endFrame && frame < frames; ++frame) {
-            processFrame(frame);
+        processRange(frame, segmentEnd);
+        frame = segmentEnd;
+    }
+
+    while (eventIndex < eventCount) {
+        if (const clap_event_header_t* event = in->get(in, eventIndex)) {
+            handleEvent(event);
         }
+        ++eventIndex;
     }
 }
